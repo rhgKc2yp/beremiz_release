@@ -1,0 +1,147 @@
+name: Build and verify Beremiz
+
+on:
+  schedule:
+    - cron: '23 6 * * *'
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Upstream stable tag (empty means latest)
+        type: string
+      revision:
+        description: Community build revision
+        type: string
+        default: '1'
+      publish:
+        description: Publish after every architecture passes verification
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: beremiz-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-26.04
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      build: ${{ steps.resolve.outputs.build }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Resolve immutable source inputs
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ inputs.tag }}
+          BUILD_REVISION: ${{ inputs.revision || '1' }}
+          EVENT_NAME: ${{ github.event_name }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          tag=$(python3 scripts/resolve.py --tag "$UPSTREAM_TAG" --revision "$BUILD_REVISION")
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 &&
+             { [ "$EVENT_NAME" = schedule ] || { [ "$EVENT_NAME" = workflow_dispatch ] && [ "$PUBLISH" = true ]; }; }; then
+            echo 'build=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'build=true' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/upload-artifact@v7
+        if: steps.resolve.outputs.build == 'true'
+        with:
+          name: resolved-sources
+          path: |
+            build/inputs.lock.json
+            build/sources/*.tar.gz
+          if-no-files-found: error
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-26.04
+            arch: x86_64
+          - runner: ubuntu-26.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: resolved-sources
+          path: build
+      - name: Install build environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak dbus-x11
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y --noninteractive flathub org.gnome.Sdk//51 org.gnome.Platform//51
+      - name: Check and extract exact sources
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, pathlib, subprocess
+          lock = json.loads(pathlib.Path('build/inputs.lock.json').read_text())
+          for name, record in lock['sources'].items():
+              archive = pathlib.Path('build/sources') / (name + '.tar.gz')
+              assert hashlib.sha256(archive.read_bytes()).hexdigest() == record['sha256'], name
+              target = archive.parent / name
+              target.mkdir()
+              subprocess.run(['tar', '--no-same-owner', '--strip-components=1', '-xzf', str(archive), '-C', str(target)], check=True)
+          PY
+      - name: Build and verify offline on the Platform
+        run: dbus-run-session -- bash scripts/run-build.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: verified-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    needs: [resolve, build]
+    if: >-
+      needs.resolve.outputs.build == 'true' &&
+      (github.event_name == 'schedule' ||
+       (github.event_name == 'workflow_dispatch' && inputs.publish))
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: verified-*
+          path: artifacts
+      - name: Verify assets and publish an immutable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          for arch in x86_64 aarch64; do
+            (cd "artifacts/verified-$arch" && sha256sum -c SHA256SUMS)
+          done
+          mkdir dist
+          cp artifacts/verified-x86_64/* dist/
+          cp artifacts/verified-aarch64/beremiz-*.tar.gz dist/
+          cp artifacts/verified-aarch64/RUNTIME-COMMITS.json dist/RUNTIME-COMMITS-aarch64.json
+          cp artifacts/verified-aarch64/SDK-MANIFEST.json dist/SDK-MANIFEST-aarch64.json
+          cp artifacts/verified-aarch64/UBUNTU-PACKAGES.json dist/UBUNTU-PACKAGES-aarch64.json
+          cp artifacts/verified-aarch64/layout.txt dist/layout-aarch64.txt
+          (cd dist && sha256sum *.tar.gz *.json *.txt > SHA256SUMS)
+          gh release create "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --draft --title "Beremiz ${RELEASE_TAG#v}" \
+            --notes "Community build of unmodified Beremiz sources for GNOME Platform 51. Not an official Beremiz release. Sources, revision locks, runtime commits, and checksums are attached. Both architectures passed offline IEC compile, transfer, and local PLC runtime verification. Recipe: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/tree/$GITHUB_SHA. Validation: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID." \
+            dist/*
+          gh release edit "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --draft=false --latest

@@ -1,0 +1,10 @@
+#!/bin/sh
+# Sourced by launchers, with bundle_root pointing to the extracted archive.
+export PYTHONPATH="$bundle_root/python${PYTHONPATH:+:$PYTHONPATH}"
+export LD_LIBRARY_PATH="$bundle_root/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export PATH="$bundle_root/bin:$bundle_root/toolchain/bin:$PATH"
+export SYSROOT="$bundle_root/sysroot"
+# Upstream supports redirecting application data through this variable.
+export BEREMIZ_APPDATA="${XDG_DATA_HOME:-$HOME/.local/share}/beremiz"
+export BEREMIZPYTHONPATH="$bundle_root/bin/beremiz-python"
+export PYTHONDONTWRITEBYTECODE=1

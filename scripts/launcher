@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+bundle_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+. "$bundle_root/libexec/environment"
+case "$(basename -- "$0")" in
+    beremiz) entry=Beremiz.py ;;
+    beremiz-cli) entry=Beremiz_cli.py ;;
+    beremiz-runtime) entry=Beremiz_service.py ;;
+    beremiz-python) exec /usr/bin/python3 "$@" ;;
+    *) echo "Unknown Beremiz entry point" >&2; exit 1 ;;
+esac
+exec /usr/bin/python3 "$bundle_root/beremiz/$entry" "$@"
